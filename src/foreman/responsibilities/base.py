@@ -15,10 +15,16 @@ class Check:
     check_id: str
     instructions: str
     min_threshold: float | None = None
+    evidence: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.min_threshold is not None and not 0.0 <= self.min_threshold <= 1.0:
             raise ValueError("check min_threshold must be between 0 and 1")
+        if self.evidence is not None:
+            if not self.evidence or any(not provider.strip() for provider in self.evidence):
+                raise ValueError("check evidence must contain non-empty provider ids")
+            if len(self.evidence) != len(set(self.evidence)):
+                raise ValueError("check evidence provider ids must be unique")
 
     @property
     def key(self) -> str:
@@ -62,8 +68,10 @@ class ResponsibilityRegistry:
         responsibilities: Iterable[Responsibility],
         *,
         routes: dict[str, ResponsibilityRoute] | None = None,
+        contexts: Mapping[str, str] | None = None,
     ) -> None:
         self._responsibilities = tuple(responsibilities)
+        self._contexts = dict(contexts or {})
         ids = [responsibility.id for responsibility in self._responsibilities]
         if len(ids) != len(set(ids)):
             raise ValueError("responsibility ids must be unique")
@@ -73,6 +81,12 @@ class ResponsibilityRegistry:
         if unknown_routes:
             names = ", ".join(sorted(unknown_routes))
             raise ValueError(f"routing configured for unknown responsibilities: {names}")
+        unknown_contexts = set(self._contexts) - set(ids)
+        if unknown_contexts:
+            raise ValueError(
+                "context configured for unknown responsibilities: "
+                + ", ".join(sorted(unknown_contexts))
+            )
         self._routes: dict[str, ResponsibilityRoute] = {}
         for responsibility in self._responsibilities:
             route_factory = getattr(responsibility, "route", None)
@@ -119,6 +133,9 @@ class ResponsibilityRegistry:
             if self._routes[responsibility.id].always
         )
 
+    def context_for(self, responsibility_id: str) -> str | None:
+        return self._contexts.get(responsibility_id)
+
     def routed(self, responsibility_ids: Iterable[str]) -> ResponsibilityRegistry:
         selected = set(responsibility_ids)
         known = {responsibility.id for responsibility in self._responsibilities}
@@ -136,6 +153,7 @@ class ResponsibilityRegistry:
                 responsibility.id: self._routes[responsibility.id]
                 for responsibility in responsibilities
             },
+            contexts={key: value for key, value in self._contexts.items() if key in selected},
         )
 
     def repository_instruction_files(self) -> tuple[str, ...]:

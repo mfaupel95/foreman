@@ -9,6 +9,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from foreman.config import FactoryConfig
+from foreman.evidence import run_command_evidence, selected_command_evidence
 from foreman.foreman import ForemanModel, ForemanModelError
 from foreman.models import (
     EventType,
@@ -34,7 +35,14 @@ from foreman.routing import (
     resolve_hierarchical_routing,
 )
 from foreman.steering import build_steering_message
-from foreman.workers import CodexAppServerWorker, CodexWorker, OpenCodeWorker, Worker
+from foreman.workers import (
+    CodexAppServerWorker,
+    CodexWorker,
+    DeepAgentsWorker,
+    HermesWorker,
+    OpenCodeWorker,
+    Worker,
+)
 from foreman.workers.codex import mission_for
 
 EventSink = Callable[[FactoryEvent], object]
@@ -158,17 +166,40 @@ class FactoryRuntime:
 
     def _default_worker_factory(self, worker_type: WorkerType) -> Worker:
         del worker_type
+        if self.config.worker_backend == "deepagents":
+            return DeepAgentsWorker(
+                executable=self.config.deepagents_executable,
+                model=self.config.deepagents_model,
+                max_turns=self.config.deepagents_max_turns,
+                shell_allow_list=self.config.deepagents_shell_allow_list,
+                output_limit=self.config.output_limit,
+                graceful_termination_seconds=self.config.graceful_termination_seconds,
+            )
         if self.config.worker_backend == "opencode":
             return OpenCodeWorker(
                 output_limit=self.config.output_limit,
                 graceful_termination_seconds=self.config.graceful_termination_seconds,
             )
+        if self.config.worker_backend == "hermes":
+            return HermesWorker(
+                executable=self.config.hermes_executable,
+                model=self.config.hermes_model,
+                provider=self.config.hermes_provider,
+                max_turns=self.config.hermes_max_turns,
+                toolsets=self.config.hermes_toolsets,
+                output_limit=self.config.output_limit,
+                graceful_termination_seconds=self.config.graceful_termination_seconds,
+            )
         if self.config.codex_backend == "app-server":
             return CodexAppServerWorker(
+                executable=self.config.codex_executable,
+                model=self.config.codex_model,
                 output_limit=self.config.output_limit,
                 graceful_termination_seconds=self.config.graceful_termination_seconds,
             )
         return CodexWorker(
+            executable=self.config.codex_executable,
+            model=self.config.codex_model,
             output_limit=self.config.output_limit,
             graceful_termination_seconds=self.config.graceful_termination_seconds,
         )
@@ -229,6 +260,57 @@ class FactoryRuntime:
             record.termination_reason = "worker_exception"
             record.stderr = f"{record.stderr}\n{type(error).__name__}: {error}".strip()
         finally:
+            if record.worker_type is WorkerType.VERIFIER:
+                self.state.verification_completed = True
+                passed = record.status is WorkerStatus.COMPLETED
+                self.state.verification_results.append(
+                    VerificationResult(
+                        worker_id=record.worker_id,
+                        passed=passed,
+                        summary=(record.stdout or record.stderr)[-self.config.output_limit :],
+                    )
+                )
+
+            if (
+                record.worker_type is WorkerType.CODING
+                and record.status is WorkerStatus.COMPLETED
+            ):
+                providers = selected_command_evidence(
+                    self.responsibilities.checks(), self.config.command_evidence
+                )
+                for provider in providers:
+                    await self.emit(
+                        EventType.COMMAND_EVIDENCE_STARTED,
+                        {
+                            "provider_id": f"command.{provider.id}",
+                            "worker_id": record.worker_id,
+                        },
+                        notify_foreman=False,
+                    )
+                    result = await run_command_evidence(
+                        provider,
+                        self.repository,
+                        worker_id=record.worker_id,
+                        output_limit=self.config.output_limit,
+                    )
+                    self.state.command_evidence.append(result)
+                    self.state.touch()
+                    self.store.save_state(self.state)
+                    await self.emit(
+                        EventType.COMMAND_EVIDENCE_COMPLETED,
+                        {
+                            "provider_id": result.provider_id,
+                            "worker_id": record.worker_id,
+                            "status": result.status,
+                            "exit_code": result.exit_code,
+                            "elapsed_seconds": result.elapsed_seconds,
+                        },
+                        notify_foreman=False,
+                    )
+
+            # Keep the worker lifecycle-active until selected evidence is persisted. Otherwise a
+            # periodic assessment could observe no active worker and finish while a slow provider
+            # was still running.
             if record.worker_id in self.state.active_workers:
                 self.state.active_workers.remove(record.worker_id)
             if record.status is WorkerStatus.COMPLETED:
@@ -241,17 +323,6 @@ class FactoryRuntime:
                 self.state.failed_workers.append(record.worker_id)
                 self.state.errors.append(
                     f"{record.worker_id}: {record.termination_reason or record.status.value}"
-                )
-
-            if record.worker_type is WorkerType.VERIFIER:
-                self.state.verification_completed = True
-                passed = record.status is WorkerStatus.COMPLETED
-                self.state.verification_results.append(
-                    VerificationResult(
-                        worker_id=record.worker_id,
-                        passed=passed,
-                        summary=(record.stdout or record.stderr)[-self.config.output_limit :],
-                    )
                 )
 
             self.state.touch()
@@ -318,6 +389,16 @@ class FactoryRuntime:
     async def _assess(self) -> Intervention | None:
         self.state.iteration += 1
         self.state.touch()
+        configuration_error = self.policy.configuration_error(self.state)
+        if configuration_error is not None:
+            self.state.latest_intervention = configuration_error
+            self.state.intervention_history.append(configuration_error)
+            self.store.save_state(self.state)
+            await self.emit(
+                EventType.FOREMAN_INTERVENED,
+                configuration_error.model_dump(mode="json"), notify_foreman=False,
+            )
+            return configuration_error
         observation = await self.observer.build(self.state)
         await self.emit(
             EventType.FOREMAN_OBSERVED,

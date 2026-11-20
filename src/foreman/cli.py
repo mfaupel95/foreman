@@ -3,36 +3,62 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import sys
 from datetime import UTC
 from pathlib import Path
 from typing import Annotated
 
 import typer
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from rich.console import Console
 from rich.table import Table
 
+from foreman import __version__
 from foreman.config import FactoryConfig
+from foreman.decision_models import OpenAIDecisionAdapter, OpenAIRequestBudget
+from foreman.deepagents_setup import install_deepagents_hooks
 from foreman.extensions import (
     ExtensionError,
     ExtensionIdentity,
     ExtensionManager,
     ExtensionSnapshot,
+    load_foreman_file_config,
 )
-from foreman.foreman import FakeForemanModel, JevForemanModel
+from foreman.foreman import (
+    DecisionForemanModel,
+    FakeForemanModel,
+    ForemanModel,
+    JevForemanModel,
+)
 from foreman.hook_adapters import hook_adapter
-from foreman.hooks import AttachedSessionStore, AttachedWorkerRuntime, HookError, run_hook
+from foreman.hooks import (
+    AttachedSessionStore,
+    AttachedWorkerRuntime,
+    HookError,
+    HookEvent,
+    run_hook,
+)
 from foreman.models import EventType, FactoryStatus, WorkerType
 from foreman.paths import foreman_config_path, foreman_data_dir
 from foreman.persistence import PersistenceError, RunStore
+from foreman.repository_scope import repository_in_scope
+from foreman.request_budget import JevRequestBudget
 from foreman.responsibilities import (
     ResponsibilityConfigError,
     configured_registry,
 )
-from foreman.routing import GlobalResponsibilityRouter, JevResponsibilityRouter
+from foreman.routing import (
+    DecisionResponsibilityRouter,
+    GlobalResponsibilityRouter,
+    JevResponsibilityRouter,
+    ResponsibilityRouter,
+    ResponsibilityRoutingError,
+    prune_disabled_route_groups,
+)
 from foreman.runtime import FactoryRuntime
 from foreman.terminal import TerminalRenderer, duration_label, elapsed_label
+from foreman.usage import DecisionUsageRecorder
 from foreman.workers import FakeWorker
 
 app = typer.Typer(
@@ -42,7 +68,71 @@ app = typer.Typer(
 )
 extension_app = typer.Typer(help="Manage configured Foreman extensions.", no_args_is_help=True)
 app.add_typer(extension_app, name="extension")
+deepagents_app = typer.Typer(help="Set up native Deep Agents Code hooks.", no_args_is_help=True)
+app.add_typer(deepagents_app, name="deepagents")
 console = Console()
+
+
+@app.callback(invoke_without_command=True)
+def main(
+    version: Annotated[bool, typer.Option("--version", is_eager=True)] = False,
+) -> None:
+    """Supervise coding workers through the installed Foreman release."""
+    if version:
+        typer.echo(f"foreman-core {__version__}")
+        raise typer.Exit()
+
+
+def _load_decision_dotenv(path: Path) -> None:
+    """Load central supervisor settings without changing a managed worker's settings."""
+    values = dotenv_values(path)
+    for name, value in values.items():
+        if value is not None and name.startswith((
+            "FOREMAN_DECISION_", "FOREMAN_JEV_", "FOREMAN_OPENAI_", "TYPESAFE_",
+        )):
+            os.environ.setdefault(name, value)
+    # Central SDK settings belong to the supervisor. Do not export shared names
+    # into a launched worker's environment; existing process SDK settings still work.
+    for suffix in ("API_KEY", "BASE_URL", "ORG_ID", "PROJECT_ID"):
+        shared, dedicated = f"OPENAI_{suffix}", f"FOREMAN_OPENAI_{suffix}"
+        value = values.get(shared)
+        if value is not None and shared not in os.environ:
+            os.environ.setdefault(dedicated, value)
+
+
+def _decision_components(
+    config: FactoryConfig, data_dir: Path,
+) -> tuple[ForemanModel, ResponsibilityRouter]:
+    budget_type = (
+        OpenAIRequestBudget if config.decision_provider == "openai" else JevRequestBudget
+    )
+    budget = budget_type(
+        config.decision_pair_budget_bytes, config.decision_request_budget_bytes,
+        target_pair_bytes=config.decision_pair_target_bytes,
+        target_total_bytes=config.decision_request_target_bytes,
+    )
+    usage = DecisionUsageRecorder(data_dir / "decision-usage.jsonl")
+    options = {"timeout_seconds": config.decision_timeout_seconds,
+               "budget": budget, "usage_recorder": usage}
+    if config.decision_provider == "jev":
+        if config.decision_model is not None:
+            options["model"] = config.decision_model
+        return JevForemanModel(**options), JevResponsibilityRouter(**options)
+    # Separate owned clients avoid ambiguous shutdown ownership between model and router.
+    def adapter() -> OpenAIDecisionAdapter:
+        return OpenAIDecisionAdapter(
+            timeout_seconds=config.decision_timeout_seconds,
+            model=config.decision_model or "gpt-6-luna",
+        )
+    return (DecisionForemanModel(adapter(), **options),
+            DecisionResponsibilityRouter(adapter(), **options))
+
+
+def _discard_attached_session(event: HookEvent, data_dir: Path) -> None:
+    store = AttachedSessionStore(data_dir)
+    if store.path_for(event.session_id, event.client).exists():
+        with store.locked(event.session_id, event.client):
+            store.delete(event.session_id, event.client)
 
 
 def _run_async(runtime: FactoryRuntime) -> FactoryStatus:
@@ -56,6 +146,32 @@ def _run_async(runtime: FactoryRuntime) -> FactoryStatus:
 
 def _extension_manager(data_dir: Path | None) -> ExtensionManager:
     return ExtensionManager(data_dir=data_dir)
+
+
+@deepagents_app.command("setup")
+def deepagents_setup(
+    hooks_file: Annotated[
+        Path | None,
+        typer.Option("--hooks-file", dir_okay=False,
+                     help="Hooks v2 file (default: ~/.deepagents/hooks.json)"),
+    ] = None,
+    foreman_executable: Annotated[
+        str | None,
+        typer.Option("--foreman-executable", help="Foreman command to invoke from dcode"),
+    ] = None,
+) -> None:
+    """Add Foreman lifecycle hooks, preserving existing handlers and settings."""
+    path = (hooks_file or Path.home() / ".deepagents" / "hooks.json").expanduser().resolve()
+    executable = foreman_executable or shutil.which("foreman") or "foreman"
+    try:
+        changed = install_deepagents_hooks(path, executable)
+    except (OSError, ValueError) as error:
+        typer.echo(f"Deep Agents hook setup failed: {error}", err=True)
+        raise typer.Exit(code=2) from error
+    typer.echo(f"{'Installed' if changed else 'Already installed'} Foreman hooks: {path}")
+    typer.echo(
+        "Configure Foreman credentials and responsibilities, then start a fresh dcode session."
+    )
 
 
 @extension_app.command("login")
@@ -196,6 +312,11 @@ def hook(
 ) -> None:
     """Process one coding-assistant hook event from stdin."""
 
+    if os.getenv("FOREMAN_MANAGED_WORKER") == "1":
+        # The owning factory already supplies routing, checks, and completion control.
+        sys.stdout.write("{}\n")
+        return
+
     extensions: ExtensionManager | None = None
     runtime_started = False
     try:
@@ -206,31 +327,50 @@ def hook(
             raise HookError("hook input must be a JSON object")
         adapter = hook_adapter(client)
         event = adapter.parse(payload)
+        central = load_foreman_file_config(config_path=central_config_path)
+        if not repository_in_scope(event.cwd, central.hooks.repositories):
+            _discard_attached_session(event, central_data_dir)
+            sys.stdout.write("{}\n")
+            return
         load_dotenv(override=False)
+        load_dotenv(central_data_dir / ".env", override=False)
         config = FactoryConfig.from_environment()
         extensions = ExtensionManager(
             data_dir=central_data_dir,
             config_path=central_config_path,
         )
+        config = config.model_copy(
+            update={"command_evidence": extensions.config.evidence.commands}
+        )
         activated = extensions.activate(config)
         registrations = activated.responsibilities
+        responsibilities = configured_registry(
+            config,
+            additional=(item.implementation for item in registrations),
+            additional_configs={item.implementation.id: item.definition for item in registrations},
+            overrides=central.hooks.responsibilities,
+            require_lifecycle=False,
+        )
+        if not responsibilities.responsibilities:
+            _discard_attached_session(event, central_data_dir)
+            asyncio.run(extensions.close())
+            sys.stdout.write("{}\n")
+            return
+        model, router = _decision_components(config, central_data_dir)
         runtime = AttachedWorkerRuntime(
-            model=JevForemanModel(timeout_seconds=config.jev_timeout_seconds),
-            router=JevResponsibilityRouter(timeout_seconds=config.jev_timeout_seconds),
-            responsibilities=configured_registry(
-                config,
-                additional=(item.implementation for item in registrations),
-                additional_configs={
-                    item.implementation.id: item.definition for item in registrations
-                },
-            ),
+            model=model,
+            router=router,
+            responsibilities=responsibilities,
             config=config,
             store=AttachedSessionStore(
                 central_data_dir,
                 ttl_seconds=config.hook_session_ttl_seconds,
-                lock_timeout_seconds=max(30.0, config.jev_timeout_seconds * 3),
+                lock_timeout_seconds=max(30.0, config.decision_timeout_seconds * 3),
             ),
-            routing_groups=activated.routing_groups,
+            routing_groups=prune_disabled_route_groups(
+                activated.routing_groups,
+                {key for key, value in central.hooks.responsibilities.items() if not value.enabled},
+            ),
             active_extension_ids=activated.extension_ids,
             extension_snapshot_revisions=dict(activated.snapshot_revisions),
         )
@@ -249,6 +389,7 @@ def hook(
         ExtensionError,
         HookError,
         ResponsibilityConfigError,
+        ResponsibilityRoutingError,
     ) as error:
         if extensions is not None and not runtime_started:
             asyncio.run(extensions.close())
@@ -289,7 +430,7 @@ def run(
         ),
     ] = None,
 ) -> None:
-    """Launch a real Codex worker supervised by TypeSafe AI Jev."""
+    """Launch a coding worker supervised by a decision model."""
 
     # Capture the process-level factory setting before reading the target repository's
     # local environment. A managed repository cannot select Foreman's responsibilities.
@@ -303,17 +444,23 @@ def run(
 
     load_dotenv(repo / ".env", override=False)
     load_dotenv(override=False)
-    if not os.getenv("TYPESAFE_API_KEY"):
-        console.print(
-            "Missing TYPESAFE_API_KEY. Copy .env.example to .env and add your TypeSafe API key."
-        )
-        raise typer.Exit(code=2)
+    _load_decision_dotenv(central_data_dir / ".env")
     config = FactoryConfig.from_environment()
+    key_name = "TYPESAFE_API_KEY" if config.decision_provider == "jev" else "FOREMAN_OPENAI_API_KEY"
+    key = os.getenv(key_name)
+    if config.decision_provider == "openai":
+        key = key or os.getenv("OPENAI_API_KEY")
+    if not key:
+        console.print(f"Missing {key_name}. Configure credentials for {config.decision_provider}.")
+        raise typer.Exit(code=2)
     extensions: ExtensionManager | None = None
     try:
         extensions = ExtensionManager(
             data_dir=central_data_dir,
             config_path=central_config_path,
+        )
+        config = config.model_copy(
+            update={"command_evidence": extensions.config.evidence.commands}
         )
         activated = extensions.activate(config)
         registrations = activated.responsibilities
@@ -325,14 +472,15 @@ def run(
                 item.implementation.id: item.definition for item in registrations
             },
         )
+        model, router = _decision_components(config, extensions.data_dir)
         runtime = FactoryRuntime(
             repository=repo,
             job=job,
-            model=JevForemanModel(timeout_seconds=config.jev_timeout_seconds),
+            model=model,
             config=config,
             event_sink=TerminalRenderer(console),
             responsibilities=responsibilities,
-            router=JevResponsibilityRouter(timeout_seconds=config.jev_timeout_seconds),
+            router=router,
             routing_groups=activated.routing_groups,
             active_extension_ids=activated.extension_ids,
             extension_snapshot_revisions=dict(activated.snapshot_revisions),

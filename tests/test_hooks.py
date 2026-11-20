@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from typer.testing import CliRunner
 
 from foreman.cli import app
-from foreman.config import FactoryConfig
+from foreman.config import CommandEvidenceConfig, FactoryConfig
 from foreman.foreman import ForemanModelError
 from foreman.hook_adapters import CodexHookAdapter, hook_adapter
 from foreman.hooks import (
@@ -98,6 +100,72 @@ class FailingModel(StubModel):
         raise ForemanModelError("Jev unavailable")
 
 
+@pytest.mark.asyncio
+async def test_current_operation_is_separate_from_truncated_event_history(tmp_path) -> None:
+    model = StubModel()
+    supervisor, store, _ = runtime(tmp_path, model=model, runtime_config=config(output_limit=100))
+    await handle(supervisor, event("UserPromptSubmit", tmp_path, prompt="Fix the tests"))
+    tool_input = {"command": "BEGIN " + "x" * 2000 + " END"}
+    await handle(supervisor, event(
+        "PreToolUse", tmp_path, tool_name="shell", tool_input=tool_input,
+    ))
+    observation = model.calls[-1][0]
+    assert observation.current_operation["tool_input"] == tool_input
+    assert observation.state_for(("git.diff",))["current_operation"]["tool_input"] == tool_input
+    assert len(store.load("thr-attached-123").recent_events[-1]["summary"]) < len(str(tool_input))
+
+
+@pytest.mark.asyncio
+async def test_current_operation_overflow_keeps_hook_fail_closed(tmp_path) -> None:
+    from foreman.foreman import JevForemanModel
+
+    class NoNetwork:
+        async def system_one(self, **kwargs):
+            pytest.fail("oversized essential operation must not reach the API")
+
+    supervisor, _, _ = runtime(tmp_path, model=JevForemanModel(client=NoNetwork()))
+    await handle(supervisor, event("UserPromptSubmit", tmp_path, prompt="Fix the tests"))
+    outcome = await handle(supervisor, event(
+        "PreToolUse", tmp_path, tool_name="shell", tool_input={"command": "x" * 40_000},
+    ))
+    assert outcome["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "request budget exceeded" in outcome["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+@pytest.mark.asyncio
+async def test_existing_oversized_session_recovers_without_clearing_saved_history(tmp_path) -> None:
+    from foreman.foreman import JevForemanModel
+    from foreman.request_budget import JevRequestBudget
+
+    class BudgetCheckingClient:
+        calls = []
+
+        async def system_one(self, *, state, questions, **kwargs):
+            sizes = JevRequestBudget().measure(
+                state, {key: question.instructions for key, question in questions.items()},
+            )
+            assert sizes["pair_bytes"] <= 30_000
+            assert sizes["total_bytes"] <= 60_000
+            self.calls.append(state)
+            scores = {"worker_stuck", "work_off_track", "agents_md_drift", "needs_human",
+                      "needs_verification"}
+            return {key: 0.0 if key.split("__")[-1] in scores else 0.99 for key in questions}
+
+    client = BudgetCheckingClient()
+    supervisor, store, _ = runtime(tmp_path, model=JevForemanModel(client=client))
+    await handle(supervisor, event("UserPromptSubmit", tmp_path, prompt="Fix the tests"))
+    session = store.load("thr-attached-123")
+    session.recent_events = [{"summary": "old result " * 1200} for _ in range(30)]
+    store.save(session)
+
+    outcome = await handle(supervisor, event(
+        "PreToolUse", tmp_path, tool_name="shell", tool_input={"command": "pytest -q"},
+    ))
+    assert outcome == {}
+    assert client.calls and "evidence_budget" in client.calls[0]
+    assert store.load("thr-attached-123").recent_events[0]["summary"] == "old result " * 1200
+
+
 def config(**updates) -> FactoryConfig:
     values = {
         "jev_timeout_seconds": 0.5,
@@ -126,7 +194,7 @@ async def handle(supervisor: AttachedWorkerRuntime, payload: dict) -> dict:
     return adapter.render(event, outcome)
 
 
-def runtime(tmp_path, model=None, runtime_config=None):
+def runtime(tmp_path, model=None, runtime_config=None, responsibilities_dir=None):
     runtime_config = runtime_config or config()
     store = AttachedSessionStore(
         tmp_path / "foreman-data",
@@ -136,11 +204,64 @@ def runtime(tmp_path, model=None, runtime_config=None):
     supervisor = AttachedWorkerRuntime(
         model=model or StubModel(),
         router=router,
-        responsibilities=configured_registry(runtime_config),
+        responsibilities=configured_registry(
+            runtime_config, config_dir=responsibilities_dir
+        ),
         config=runtime_config,
         store=store,
     )
     return supervisor, store, router
+
+
+@pytest.mark.asyncio
+async def test_deepagents_routing_steering_failure_evidence_and_completion(tmp_path) -> None:
+    model = StubModel(work_off_track=0.96)
+    supervisor, store, router = runtime(tmp_path, model)
+    adapter = hook_adapter("deepagents")
+    base = {"session_id": "dcode-session", "cwd": str(tmp_path), "prompt_id": "p1"}
+
+    async def native(name, **fields):
+        normalized = adapter.parse({**base, "hook_event_name": name, **fields})
+        return adapter.render(normalized, await supervisor.handle(normalized))
+
+    assert await native("SessionStart") == {}
+    await native("UserPromptSubmit", prompt="Implement the feature")
+    await native("UserPromptSubmit", prompt="Implement the feature")
+    assert router.calls == ["Implement the feature"]
+    output = await native("PostToolUseFailure", tool_name="Bash", tool_use_id="c1",
+                          tool_input={"command": "pytest"}, error="tests failed")
+    assert output["hookSpecificOutput"] == {
+        "hookEventName": "PostToolUseFailure",
+        "additionalContext": "active worker appears off track",
+    }
+    session = store.load("dcode-session", "deepagents")
+    assert session.state.workers[0].steer_count == 1
+    assert "tests failed" in model.calls[0][0].latest_worker_output
+    # Let completion checks determine the next outcome independently of drift.
+    model.scores["work_off_track"] = 0
+    output = await native("Stop", stop_hook_active=False, last_assistant_message="Started")
+    assert output["decision"] == "block"
+    output = await native("Stop", stop_hook_active=True, last_assistant_message="Still incomplete")
+    assert output["continue"] is False
+    assert "one automatic continuation" in output["systemMessage"]
+    assert await native("SessionEnd") == {}
+    assert store.load("dcode-session", "deepagents") is None
+
+
+@pytest.mark.asyncio
+async def test_deepagents_pre_tool_block(tmp_path) -> None:
+    supervisor, _, _ = runtime(tmp_path, StubModel(needs_human=0.99))
+    adapter = hook_adapter("deepagents")
+    base = {"session_id": "dcode-session", "cwd": str(tmp_path), "prompt_id": "p1"}
+    submitted = adapter.parse({
+        **base, "hook_event_name": "UserPromptSubmit", "prompt": "Fix tests",
+    })
+    await supervisor.handle(submitted)
+    before = adapter.parse({**base, "hook_event_name": "PreToolUse",
+                            "tool_name": "Bash", "tool_use_id": "c1",
+                            "tool_input": {"command": "pytest"}})
+    output = adapter.render(before, await supervisor.handle(before))
+    assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 @pytest.mark.asyncio
@@ -256,11 +377,53 @@ async def test_ready_stop_finishes_attached_worker(tmp_path) -> None:
     await handle(supervisor, event("UserPromptSubmit", tmp_path, prompt="Implement it"))
 
     assert await handle(supervisor, event("Stop", tmp_path)) == {}
-
     session = store.load("thr-attached-123")
     assert session is not None and session.state is not None
     assert session.state.status is FactoryStatus.FINISHED
     assert session.state.active_workers == []
+
+
+@pytest.mark.asyncio
+async def test_attached_stop_collects_check_selected_command_evidence(tmp_path) -> None:
+    model = StubModel(
+        implementation_complete=0.99,
+        requirements_satisfied=0.99,
+        ready_to_finish=0.99,
+        tests_sufficient=0.99,
+        needs_verification=0.0,
+    )
+    responsibility_dir = tmp_path / "responsibilities"
+    responsibility_dir.mkdir()
+    (responsibility_dir / "core.verification.toml").write_text(
+        """
+[checks.tests_sufficient]
+instructions = "Does the external evidence show sufficient passing verification?"
+min_threshold = 0.75
+evidence = ["command.external"]
+""".strip(),
+        encoding="utf-8",
+    )
+    runtime_config = config(
+        command_evidence=(
+            CommandEvidenceConfig(
+                id="external",
+                command=(sys.executable, "-c", "raise SystemExit(3)"),
+            ),
+        )
+    )
+    supervisor, store, _ = runtime(
+        tmp_path, model, runtime_config, responsibility_dir
+    )
+    await handle(supervisor, event("UserPromptSubmit", tmp_path, prompt="Implement it"))
+
+    output = await handle(supervisor, event("Stop", tmp_path))
+
+    assert output == {}
+    session = store.load("thr-attached-123")
+    assert session is not None and session.state is not None
+    assert session.state.status is FactoryStatus.FINISHED
+    assert session.state.command_evidence[-1].exit_code == 3
+    assert model.calls[-1][0].command_evidence[-1]["provider_id"] == "command.external"
 
 
 @pytest.mark.asyncio
@@ -304,6 +467,18 @@ def test_session_store_hashes_ids_and_purges_expired_records(tmp_path) -> None:
     assert "unsafe" not in path.name
     assert store.purge_expired() == 1
     assert not path.exists()
+
+
+def test_session_store_save_works_without_fchmod(monkeypatch, tmp_path) -> None:
+    monkeypatch.delattr(os, "fchmod", raising=False)
+    store = AttachedSessionStore(tmp_path / "data", ttl_seconds=60)
+    session = store.new("thr-123", tmp_path)
+
+    store.save(session)
+
+    restored = store.load("thr-123")
+    assert restored is not None
+    assert restored.session_id == "thr-123"
 
 
 @pytest.mark.asyncio
@@ -480,3 +655,112 @@ async def test_attached_runtime_rejects_snapshot_change_between_hooks(tmp_path) 
             changed,
             event("PreToolUse", tmp_path, tool_name="Bash", tool_input={"command": "pwd"}),
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('client', ['pi', 'pi-durable'])
+async def test_pi_runtime_preserves_operation_and_session_namespace(tmp_path, client):
+    model = StubModel()
+    supervisor, store, _ = runtime(tmp_path, model=model)
+    adapter = hook_adapter(client)
+    base = {'session_id': 'same-id', 'cwd': str(tmp_path), 'work_id': 'work-1'}
+    submitted = {'type': 'input', 'text': 'Fix the tests'} if client == 'pi' else {
+        'type': 'beforeRequest', 'prompt': 'Fix the tests',
+    }
+    await supervisor.handle(adapter.parse({**base, 'event': submitted}))
+    arguments = {'command': 'BEGIN ' + 'x' * 2000 + ' END'}
+    tool = {'type': 'tool_call', 'toolName': 'bash', 'toolCallId': 'c1', 'input': arguments}
+    if client == 'pi-durable':
+        tool = {'type': 'beforeTool', 'call': {'name': 'bash', 'id': 'c1',
+                                             'arguments': arguments}}
+    await supervisor.handle(adapter.parse({**base, 'event': tool}))
+    assert model.calls[-1][0].current_operation['tool_input'] == arguments
+    assert store.load('same-id', client).state.workers[0].client == client
+    assert store.load('same-id', 'codex') is None
+
+
+@pytest.mark.asyncio
+async def test_durable_replay_preserves_routing_and_one_continuation(tmp_path):
+    supervisor, store, router = runtime(tmp_path)
+    adapter = hook_adapter('pi-durable')
+    base = {'session_id': 'store:conversation-1', 'cwd': str(tmp_path)}
+    work = adapter.parse({**base, 'work_id': '[12]',
+                          'event': {'type': 'beforeRequest', 'prompt': 'Fix the tests'}})
+    first = await supervisor.handle(work)
+    assert first.action is HookAction.INJECT_CONTEXT
+    stop = adapter.parse({**base, 'event_id': 'onYield:14',
+                          'event': {'type': 'onYield', 'last_assistant_message': 'Incomplete'}})
+    outcome = await supervisor.handle(stop)
+    assert outcome.action is HookAction.BLOCK
+    iterations = store.load(base['session_id'], 'pi-durable').state.iteration
+
+    # A new runtime simulates process restart, including the window after Foreman
+    # saves its decision but before Pi commits its task memo.
+    restarted, _, new_router = runtime(tmp_path)
+    assert await restarted.handle(stop) == outcome
+    assert await restarted.handle(work) == first
+    session = store.load(base['session_id'], 'pi-durable')
+    assert session.state.iteration == iterations
+    assert session.state.job == 'Fix the tests'
+    assert router.calls == ['Fix the tests'] and new_router.calls == []
+
+    next_stop = stop.model_copy(update={'event_id': 'onYield:18'})
+    assert (await restarted.handle(next_stop)).action is HookAction.HALT
+    # A real new submission resets the allowance; identical text is still new work.
+    await restarted.handle(work.model_copy(update={'work_id': '[20]'}))
+    assert new_router.calls == ['Fix the tests']
+    assert (await restarted.handle(stop.model_copy(update={'event_id': 'onYield:21'}))).action \
+        is HookAction.BLOCK
+
+
+@pytest.mark.asyncio
+async def test_reused_work_and_event_ids_reject_changed_input(tmp_path):
+    supervisor, _, _ = runtime(tmp_path)
+    adapter = hook_adapter('pi-durable')
+    base = {'session_id': 's', 'cwd': str(tmp_path)}
+    work = adapter.parse({**base, 'work_id': '1',
+                          'event': {'type': 'beforeRequest', 'prompt': 'Fix the tests'}})
+    await supervisor.handle(work)
+    with pytest.raises(HookError, match='work_id was reused'):
+        await supervisor.handle(work.model_copy(update={'prompt': 'Different work'}))
+    stop = adapter.parse({**base, 'event_id': 'yield:2',
+                          'event': {'type': 'onYield', 'last_assistant_message': 'Incomplete'}})
+    await supervisor.handle(stop)
+    with pytest.raises(HookError, match='event_id was reused'):
+        await supervisor.handle(stop.model_copy(update={
+            'last_assistant_message': 'Different answer',
+        }))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('client', ['pi', 'pi-durable'])
+async def test_pi_assessment_failure_denies_tool(tmp_path, client):
+    supervisor, _, _ = runtime(tmp_path, model=FailingModel())
+    adapter = hook_adapter(client)
+    base = {'session_id': 's', 'cwd': str(tmp_path), 'work_id': 'work-1'}
+    submitted = {'type': 'input', 'text': 'Fix the tests'} if client == 'pi' else {
+        'type': 'beforeRequest', 'prompt': 'Fix the tests',
+    }
+    await supervisor.handle(adapter.parse({**base, 'event': submitted}))
+    tool = {'type': 'tool_call', 'toolName': 'bash', 'input': {'command': 'pytest'}}
+    if client == 'pi-durable':
+        tool = {'type': 'beforeTool', 'call': {'name': 'bash',
+                                             'arguments': {'command': 'pytest'}}}
+    event = adapter.parse({**base, 'event': tool})
+    output = adapter.render(event, await supervisor.handle(event))
+    assert output['action'] == 'block'
+    assert 'Jev unavailable' in output['reason']
+
+
+def test_factory_owned_worker_hooks_do_not_start_duplicate_supervision(tmp_path, monkeypatch):
+    monkeypatch.setenv("FOREMAN_MANAGED_WORKER", "1")
+    monkeypatch.setenv("FOREMAN_CONFIG", "/must/not/be/read")
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Managed workers must not route or assess again through native hooks")
+    monkeypatch.setattr("foreman.cli.ExtensionManager", forbidden)
+    result = CliRunner().invoke(
+        app, ["hook", "--data-dir", str(tmp_path)], input='{"event": "stop"}'
+    )
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == {}
+    assert not list(tmp_path.iterdir())

@@ -11,6 +11,16 @@ from foreman.persistence import RunStore
 
 
 @pytest.mark.asyncio
+async def test_observation_preserves_full_job_for_budget_validation(tmp_path) -> None:
+    job = "BEGIN " + "x" * 2000 + " END"
+    state = FactoryState(run_id="run-1", job=job, repository=str(tmp_path))
+    store = RunStore(tmp_path)
+    store.initialize(state)
+    observation = await ObservationBuilder(store, FactoryConfig(output_limit=100)).build(state)
+    assert observation.original_job == job
+
+
+@pytest.mark.asyncio
 async def test_observation_reads_repository_agents_md_without_persisting_it(tmp_path) -> None:
     marker = "run the repository-specific verification command"
     (tmp_path / "AGENTS.md").write_text(marker, encoding="utf-8")
@@ -87,3 +97,17 @@ async def test_observation_includes_non_secret_routing_bindings(tmp_path) -> Non
     }
     assert observation.active_extension_ids == ["example"]
     assert observation.extension_snapshot_revisions == {"example": "revision-7"}
+
+
+@pytest.mark.asyncio
+async def test_verification_lifecycle_is_in_selected_evidence(state, tmp_path):
+    state.repository = str(tmp_path)
+    state.verification_started = True
+    state.verification_completed = True
+    store = RunStore(tmp_path)
+    store.initialize(state)
+    value = await ObservationBuilder(store, FactoryConfig()).build(state)
+    selected = value.state_for(("verification",))
+    assert selected["verification_started"] is True
+    assert selected["verification_completed"] is True
+    assert "verification_completed" not in value.state_for(("git.diff",))

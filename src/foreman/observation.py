@@ -8,8 +8,10 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from foreman.config import FactoryConfig
+from foreman.evidence import BUILTIN_EVIDENCE_FIELDS
 from foreman.models import FactoryState, ForemanResult, Intervention, WorkerRecord
 from foreman.persistence import RunStore
+from foreman.test_summary import parse_pytest_summaries
 
 
 class FactoryObservation(BaseModel):
@@ -18,6 +20,7 @@ class FactoryObservation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     original_job: str
+    current_operation: dict[str, Any] = Field(default_factory=dict)
     run_id: str
     factory_status: str
     iteration: int = Field(ge=0)
@@ -31,11 +34,15 @@ class FactoryObservation(BaseModel):
     worker_elapsed_seconds: dict[str, float]
     git_status: str
     git_diff: str
+    untracked_evidence: str = ""
     changed_files: list[str]
     agents_md_path: str | None = None
     agents_md_instructions: str = ""
     test_results: list[dict[str, Any]]
+    verification_started: bool = False
+    verification_completed: bool = False
     verification_results: list[dict[str, Any]]
+    command_evidence: list[dict[str, Any]] = Field(default_factory=list)
     recent_events: list[dict[str, Any]]
     previous_result: ForemanResult | None
     previous_intervention: Intervention | None
@@ -56,6 +63,46 @@ class FactoryObservation(BaseModel):
         if not isinstance(value, str):
             raise TypeError("observation text fields must be strings")
         return value
+
+    def state_for(self, providers: tuple[str, ...]) -> dict[str, Any]:
+        """Build the decision model state envelope for one check's selected providers."""
+
+        values = self.model_dump(mode="json")
+        state = {
+            field: values[field]
+            for field in (
+                "original_job",
+                "current_operation",
+                "run_id",
+                "factory_status",
+                "iteration",
+                "routing_bindings",
+                "active_extension_ids",
+                "extension_snapshot_revisions",
+                "attempts",
+                "elapsed_factory_seconds",
+            )
+        }
+        commands = {
+            item["provider_id"]: item for item in values["command_evidence"]
+        }
+        selected_commands: list[dict[str, Any]] = []
+        for provider in providers:
+            fields = BUILTIN_EVIDENCE_FIELDS.get(provider)
+            if fields is not None:
+                state.update({field: values[field] for field in fields})
+            elif provider.startswith("command."):
+                selected_commands.append(
+                    commands.get(
+                        provider,
+                        {"provider_id": provider, "status": "not_collected"},
+                    )
+                )
+            else:
+                raise ValueError(f"unknown evidence provider: {provider}")
+        if selected_commands:
+            state["command_evidence"] = selected_commands
+        return state
 
 
 def _tail(value: str, limit: int) -> str:
@@ -101,6 +148,7 @@ def _bounded_worker(worker: WorkerRecord, output_limit: int) -> dict[str, Any]:
         "stdout_tail": _tail(worker.stdout, output_limit),
         "stderr_tail": _tail(worker.stderr, output_limit),
         "termination_reason": worker.termination_reason,
+        "configuration_error": worker.configuration_error,
         "client": worker.client,
         "client_session_id": worker.client_session_id,
         "client_turn_id": worker.client_turn_id,
@@ -128,6 +176,128 @@ async def _git(repository: Path, *args: str, limit: int) -> str:
         return ""
     output = stdout if process.returncode == 0 else stderr
     return _tail(output.decode("utf-8", errors="replace"), limit)
+
+
+_SENSITIVE_BASENAME_PARTS = ("secret", "token", "password", "passwd", "credential")
+_SENSITIVE_BASENAME_EXACT = {".env", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
+_SENSITIVE_SUFFIXES = (".pem", ".key", ".pfx", ".p12", ".jks", ".keystore")
+
+# Untracked files larger than this are never read; the byte budget below is the
+# real bound, this only avoids loading enormous files into memory.
+_UNTRACKED_MAX_STAT_BYTES = 1_000_000
+
+
+def _looks_sensitive(name: str) -> bool:
+    """Heuristic: never include content of files whose names suggest secrets."""
+    base = name.rsplit("/", 1)[-1].lower()
+    if base in _SENSITIVE_BASENAME_EXACT or base.startswith(".env."):
+        return True
+    if any(part in base for part in _SENSITIVE_BASENAME_PARTS):
+        return True
+    return base.endswith(_SENSITIVE_SUFFIXES)
+
+
+def _expand_untracked_dir(repo_root: Path, candidate: str) -> list[str]:
+    """Expand a collapsed untracked-directory entry to individual file paths.
+
+    `git status` collapses an entirely untracked directory to a single
+    `dir/` entry unless it was asked for `--untracked-files=all`. Expanding
+    here keeps new source/test directories visible as evidence regardless of
+    how the status text was produced.
+    """
+    dir_path = repo_root / candidate
+    if dir_path.is_symlink() or not dir_path.is_dir():
+        return []
+    try:
+        entries = sorted(
+            entry for entry in dir_path.rglob("*") if entry.is_file() and not entry.is_symlink()
+        )
+    except OSError:
+        return []
+    names = []
+    for entry in entries:
+        relative = entry.relative_to(repo_root).as_posix()
+        if not _looks_sensitive(relative):
+            names.append(relative)
+    return names
+
+
+def _untracked_evidence(
+    repository: Path,
+    git_status: str,
+    *,
+    file_limit: int,
+    byte_limit: int,
+) -> str:
+    """Bounded head-of-content for untracked files named in git_status.
+
+    Workers write new tests and sources as untracked files, which `git diff`
+    never shows, leaving the supervisor without evidence of new work. Include
+    a bounded excerpt of each untracked text file so assessments can see it.
+
+    The bounds are hard: at most `file_limit` files and `byte_limit` bytes of
+    file content in total. Untracked directories are expanded to their
+    individual files so a worker adding a new source or test directory still
+    produces evidence. Binary-looking and unreadable files are skipped,
+    symlinks are not followed, paths escaping the repository are ignored, and
+    files whose names look sensitive (secrets, keys, tokens, .env files) are
+    never included. Truncation is applied to raw bytes before UTF-8 decoding,
+    so multibyte content can never exceed the byte budget. Read-only: the
+    repository is never mutated.
+    """
+    repo_root = repository.resolve()
+    paths: list[str] = []
+    for line in git_status.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("?? "):
+            continue
+        candidate = stripped[3:].strip().strip('"')
+        if not candidate or _looks_sensitive(candidate):
+            continue
+        if candidate.endswith("/"):
+            paths.extend(_expand_untracked_dir(repo_root, candidate))
+            continue
+        paths.append(candidate)
+    if not paths:
+        return ""
+
+    per_file = max(500, byte_limit // max(1, file_limit))
+    chunks: list[str] = []
+    collected = 0
+    for name in paths[:file_limit]:
+        remaining = byte_limit - collected
+        if remaining <= 0:
+            break
+        path = repo_root / name
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            resolved = path.resolve()
+            if resolved != repo_root and repo_root not in resolved.parents:
+                continue  # escapes the repository
+            if path.stat().st_size > _UNTRACKED_MAX_STAT_BYTES:
+                continue
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        if b"\x00" in raw[:4096]:
+            continue  # binary
+        # Truncate the raw bytes before decoding so the byte budget is
+        # honored for multibyte text. A codepoint cut by the byte boundary
+        # decodes to U+FFFD (3 bytes in UTF-8), so trim the encoded form as
+        # well; the emitted excerpt then never exceeds the budget.
+        budget = min(per_file, remaining)
+        total_bytes = len(raw)
+        text = raw[:budget].decode("utf-8", errors="replace")
+        encoded = text.encode("utf-8")
+        if len(encoded) > budget:
+            text = encoded[:budget].decode("utf-8", errors="ignore")
+        excerpt = text
+        if total_bytes > budget:
+            excerpt += f"\n... (truncated, {total_bytes} bytes total)"
+        chunks.append(f"--- untracked: {name} ---\n{excerpt}")
+        collected += min(total_bytes, budget)
+    return "\n".join(chunks)
 
 
 class ObservationBuilder:
@@ -161,6 +331,7 @@ async def build_observation(
     config: FactoryConfig,
     *,
     recent_events: list[dict[str, Any]],
+    current_operation: dict[str, Any] | None = None,
     repository_instruction_files: tuple[str, ...] = (
         "AGENTS.override.md",
         "AGENTS.md",
@@ -175,8 +346,11 @@ async def build_observation(
         config.field_limit,
     )
     # Git evidence is independent, so gather it without serial subprocess latency.
+    # --untracked-files=all expands untracked directories to individual files;
+    # without it git collapses a new directory to a single `dir/` entry and
+    # new sources/tests inside would never surface as evidence.
     status_task = asyncio.create_task(
-        _git(repository, "status", "--short", limit=config.field_limit)
+        _git(repository, "status", "--short", "--untracked-files=all", limit=config.field_limit)
     )
     diff_task = asyncio.create_task(
         _git(repository, "diff", "--no-ext-diff", limit=config.diff_limit)
@@ -190,9 +364,13 @@ async def build_observation(
     history = state.workers[-config.worker_history_limit :]
     latest = history[-1] if history else None
     elapsed = max(0.0, (datetime.now(UTC) - state.started_at).total_seconds())
+    latest_command_evidence = {}
+    for result in state.command_evidence:
+        latest_command_evidence[result.provider_id] = result
 
     return FactoryObservation(
-        original_job=_tail(state.job, config.field_limit),
+        original_job=state.job,
+        current_operation=current_operation or {},
         run_id=state.run_id,
         factory_status=state.status.value,
         iteration=state.iteration,
@@ -210,14 +388,31 @@ async def build_observation(
         },
         git_status=git_status,
         git_diff=git_diff,
+        untracked_evidence=_untracked_evidence(
+            repository,
+            git_status,
+            file_limit=config.untracked_evidence_file_limit,
+            byte_limit=config.untracked_evidence_byte_limit,
+        ),
         changed_files=[line for line in names.splitlines() if line][
             : config.worker_history_limit * 10
         ],
         agents_md_path=agents_md_path,
         agents_md_instructions=agents_md_instructions,
-        test_results=[],
+        test_results=[
+            {"source": "worker_output", **summary.to_dict()}
+            for summary in parse_pytest_summaries(
+                f"{latest.stdout}\n{latest.stderr}" if latest else ""
+            )
+        ],
+        verification_started=state.verification_started,
+        verification_completed=state.verification_completed,
         verification_results=[
             result.model_dump(mode="json") for result in state.verification_results
+        ],
+        command_evidence=[
+            result.model_dump(mode="json")
+            for result in latest_command_evidence.values()
         ],
         recent_events=recent_events[-config.event_history_limit :],
         previous_result=state.latest_result,

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import sys
 from collections import Counter
 
 import pytest
 
-from foreman.config import FactoryConfig
+from foreman.config import CommandEvidenceConfig, FactoryConfig
 from foreman.foreman import FakeForemanModel
 from foreman.models import EventType, FactoryAssessment, FactoryStatus, ForemanResult, WorkerType
 from foreman.persistence import RunStore
+from foreman.responsibilities import configured_registry
 from foreman.runtime import FactoryRuntime
 from foreman.workers import FakeWorker
 
@@ -115,7 +117,7 @@ async def test_agents_md_drift_is_observed_and_steered(tmp_path) -> None:
         job="Make a compliant change",
         model=model,
         config=config(),
-        worker_factory=lambda _: FakeWorker(output_lines=["working"], delay_seconds=0.02),
+        worker_factory=lambda _: FakeWorker(output_lines=["working"], delay_seconds=0.2),
     )
 
     state = await runtime.run()
@@ -204,7 +206,10 @@ async def test_noisy_events_are_coalesced(tmp_path) -> None:
         repository=tmp_path,
         job="Small job",
         model=model,
-        config=config(assessment_min_interval_seconds=0.1),
+        # Completion bypasses debounce. Keep routine assessments outside the
+        # worker's lifetime so slower event persistence cannot consume the
+        # scripted ready result while the output burst is still in progress.
+        config=config(assessment_min_interval_seconds=5, periodic_assessment_seconds=5),
         worker_factory=lambda _: FakeWorker(
             output_lines=[str(number) for number in range(50)], delay_seconds=0
         ),
@@ -217,6 +222,75 @@ async def test_noisy_events_are_coalesced(tmp_path) -> None:
     ]
     assert len(output_events) == 50
     assert len(model.calls) == 2
+    assert state.status is FactoryStatus.FINISHED
+    assert not model.calls[-1].active_workers
+
+
+@pytest.mark.asyncio
+async def test_command_evidence_completes_before_worker_completion_assessment(tmp_path) -> None:
+    ready = score(
+        implementation_complete=0.99,
+        tests_sufficient=0.99,
+        requirements_satisfied=0.99,
+        needs_verification=0.0,
+        ready_to_finish=0.99,
+    )
+    model = FakeForemanModel([ready, ready])
+    responsibility_dir = tmp_path / "responsibilities"
+    responsibility_dir.mkdir()
+    (responsibility_dir / "core.verification.toml").write_text(
+        """
+[checks.tests_sufficient]
+instructions = "Does the selected evidence show sufficient passing verification?"
+min_threshold = 0.75
+evidence = ["worker", "command.smoke"]
+""".strip(),
+        encoding="utf-8",
+    )
+    runtime_config = config(
+        assessment_min_interval_seconds=0.02,
+        periodic_assessment_seconds=0.02,
+        # The provider intentionally spans several assessment cycles. Keep the
+        # iteration guard comfortably above scheduler-dependent boundary timing.
+        max_iterations=50,
+        command_evidence=(
+            CommandEvidenceConfig(
+                id="smoke",
+                command=(
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(0.2); print('external verification passed')",
+                ),
+            ),
+        ),
+    )
+    runtime = FactoryRuntime(
+        repository=tmp_path,
+        job="Small verified job",
+        model=model,
+        config=runtime_config,
+        worker_factory=lambda _: FakeWorker(output_lines=["done"], delay_seconds=0.03),
+        responsibilities=configured_registry(
+            runtime_config, config_dir=responsibility_dir
+        ),
+    )
+
+    state = await runtime.run()
+
+    assert state.status is FactoryStatus.FINISHED
+    assert len(state.command_evidence) == 1
+    assert state.command_evidence[0].exit_code == 0
+    assert model.calls[-1].command_evidence[0]["provider_id"] == "command.smoke"
+    assert model.calls[-1].active_workers == []
+    assert all(observation.active_workers for observation in model.calls[:-1])
+    events = RunStore(tmp_path).load_events(state.run_id)
+    types = [event.event_type for event in events]
+    assert types.index(EventType.COMMAND_EVIDENCE_STARTED) < types.index(
+        EventType.COMMAND_EVIDENCE_COMPLETED
+    )
+    assert types.index(EventType.COMMAND_EVIDENCE_COMPLETED) < types.index(
+        EventType.WORKER_COMPLETED
+    )
 
 
 @pytest.mark.asyncio

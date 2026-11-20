@@ -55,3 +55,42 @@ def test_assessment_failure_budget_defaults() -> None:
 def test_assessment_failure_budget_environment_override(monkeypatch) -> None:
     monkeypatch.setenv("FOREMAN_MAX_CONSECUTIVE_ASSESSMENT_FAILURES", "5")
     assert FactoryConfig.from_environment().max_consecutive_assessment_failures == 5
+
+
+def test_request_budget_environment_overrides(monkeypatch) -> None:
+    monkeypatch.setenv("FOREMAN_JEV_PAIR_BUDGET_BYTES", "20000")
+    monkeypatch.setenv("FOREMAN_JEV_REQUEST_BUDGET_BYTES", "40000")
+    config = FactoryConfig.from_environment()
+    assert config.jev_pair_budget_bytes == 20_000
+    assert config.jev_request_budget_bytes == 40_000
+
+
+def test_request_budgets_cannot_exceed_conservative_defaults() -> None:
+    with pytest.raises(ValueError):
+        FactoryConfig(jev_pair_budget_bytes=32_000)
+
+
+def test_request_soft_target_environment_overrides(monkeypatch) -> None:
+    monkeypatch.setenv("FOREMAN_JEV_PAIR_TARGET_BYTES", "8000")
+    monkeypatch.setenv("FOREMAN_JEV_REQUEST_TARGET_BYTES", "16000")
+    config = FactoryConfig.from_environment()
+    assert config.jev_pair_target_bytes == 8000
+    assert config.jev_request_target_bytes == 16000
+    assert config.jev_pair_budget_bytes == 30_000
+
+
+@pytest.mark.parametrize("field", ["jev_pair_target_bytes", "jev_request_target_bytes"])
+def test_invalid_soft_targets_are_rejected(field) -> None:
+    with pytest.raises(ValueError):
+        FactoryConfig(**{field: 0})
+
+
+def test_codex_model_and_executable_environment_are_independent(monkeypatch):
+    monkeypatch.setenv("FOREMAN_CODEX_EXECUTABLE", "/custom/codex")
+    monkeypatch.setenv("FOREMAN_CODEX_MODEL", "worker-model")
+    monkeypatch.setenv("FOREMAN_DECISION_MODEL", "decision-model")
+    config = FactoryConfig.from_environment()
+    assert config.codex_executable == "/custom/codex"
+    assert config.codex_model == "worker-model"
+    assert config.decision_model == "decision-model"
+    assert FactoryConfig().codex_model is None

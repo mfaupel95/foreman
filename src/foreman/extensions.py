@@ -21,7 +21,8 @@ from pydantic import (
     model_validator,
 )
 
-from foreman.config import FactoryConfig
+from foreman.config import CommandEvidenceConfig, FactoryConfig
+from foreman.hook_config import HookFileConfig
 from foreman.paths import foreman_config_path, foreman_data_dir
 from foreman.responsibilities import Responsibility, ResponsibilityFileConfig
 from foreman.routing import RouteGroup
@@ -34,6 +35,22 @@ class ExtensionError(RuntimeError):
     """An installed or configured Foreman extension could not be used safely."""
 
 
+class EvidenceFileConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    commands: tuple[CommandEvidenceConfig, ...] = ()
+
+    @field_validator("commands")
+    @classmethod
+    def unique_command_ids(
+        cls, value: tuple[CommandEvidenceConfig, ...]
+    ) -> tuple[CommandEvidenceConfig, ...]:
+        ids = [provider.id for provider in value]
+        if len(ids) != len(set(ids)):
+            raise ValueError("command evidence ids must be unique")
+        return value
+
+
 class ForemanFileConfig(BaseModel):
     """Repository-independent Foreman configuration."""
 
@@ -41,6 +58,8 @@ class ForemanFileConfig(BaseModel):
 
     # Presence in this mapping enables an extension. Values belong to that extension.
     extensions: dict[str, dict[str, JsonValue]] = Field(default_factory=dict)
+    evidence: EvidenceFileConfig = Field(default_factory=EvidenceFileConfig)
+    hooks: HookFileConfig = Field(default_factory=HookFileConfig)
 
     @field_validator("extensions")
     @classmethod
@@ -51,7 +70,6 @@ class ForemanFileConfig(BaseModel):
         if invalid:
             raise ValueError(f"invalid extension ids: {', '.join(invalid)}")
         return value
-
 
 class ExtensionManifest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -235,7 +253,10 @@ class ExtensionSnapshotStore:
         )
         try:
             try:
-                os.fchmod(descriptor, 0o600)
+                if hasattr(os, "fchmod"):
+                    os.fchmod(descriptor, 0o600)
+                else:
+                    os.chmod(temporary, 0o600)
             except OSError:
                 pass
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:

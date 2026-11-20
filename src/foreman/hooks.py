@@ -16,6 +16,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from foreman.config import FactoryConfig
+from foreman.evidence import run_command_evidence_providers, selected_command_evidence
 from foreman.foreman import ForemanModel, ForemanModelError
 from foreman.models import (
     FactoryState,
@@ -64,6 +65,8 @@ class HookEvent(BaseModel):
     kind: HookEventKind
     source_event_name: str = Field(min_length=1)
     turn_id: str | None = None
+    work_id: str | None = Field(default=None, min_length=1, max_length=1_000)
+    event_id: str | None = Field(default=None, min_length=1, max_length=1_000)
     prompt: str | None = None
     tool_name: str | None = None
     tool_use_id: str | None = None
@@ -113,6 +116,12 @@ class AttachedSession(BaseModel):
     schema_version: int = 2
     client: str = "codex"
     session_id: str
+    prompt_routed: bool = False
+    work_id: str | None = None
+    work_prompt: str | None = None
+    routed_context: str | None = None
+    continuation_requested: bool = False
+    replayed_outcomes: list[dict[str, Any]] = Field(default_factory=list)
     repository: str
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -242,7 +251,10 @@ class AttachedSessionStore:
         )
         try:
             try:
-                os.fchmod(descriptor, 0o600)
+                if hasattr(os, "fchmod"):
+                    os.fchmod(descriptor, 0o600)
+                else:
+                    os.chmod(temporary, 0o600)
             except OSError:
                 pass
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -369,6 +381,13 @@ class AttachedWorkerRuntime:
             session = self.store.load(event.session_id, event.client) or self.store.new(
                 event.session_id, repository, event.client
             )
+            if event.event_id is not None:
+                fingerprint = hashlib.sha256(event.model_dump_json().encode()).hexdigest()
+                for cached in session.replayed_outcomes:
+                    if cached["event_id"] == event.event_id:
+                        if cached["fingerprint"] != fingerprint:
+                            raise HookError("event_id was reused with different input")
+                        return HookOutcome.model_validate(cached["outcome"])
             session.repository = str(repository)
             session.event_count += 1
             session.recent_events.append(_event_record(event, self.config.output_limit))
@@ -380,7 +399,25 @@ class AttachedWorkerRuntime:
                 return HookOutcome()
             if event.kind is HookEventKind.WORK_SUBMITTED:
                 try:
-                    output = await self._route_prompt(session, event)
+                    if event.work_id is not None and event.work_id == session.work_id:
+                        if session.work_prompt != event.prompt.strip():
+                            raise HookError("work_id was reused with a different prompt")
+                        if session.state is not None and (
+                            session.state.active_extension_ids != list(self.active_extension_ids)
+                            or session.state.extension_snapshot_revisions
+                            != self.extension_snapshot_revisions
+                        ):
+                            raise HookError("extension snapshots changed; submit new work")
+                        output = HookOutcome(
+                            action=HookAction.INJECT_CONTEXT,
+                            reason=session.routed_context,
+                        ) if session.routed_context else HookOutcome()
+                    else:
+                        output = await self._route_prompt(session, event)
+                        session.work_id = event.work_id
+                        session.work_prompt = event.prompt.strip()
+                        session.routed_context = output.reason
+                        session.continuation_requested = False
                 except ResponsibilityRoutingError as error:
                     output = HookOutcome(
                         action=HookAction.BLOCK,
@@ -388,6 +425,8 @@ class AttachedWorkerRuntime:
                     )
             else:
                 if session.state is None:
+                    if session.prompt_routed and not self.candidates.global_ids():
+                        return HookOutcome()
                     raise HookError(
                         f"{event.source_event_name} arrived before work_submitted"
                     )
@@ -401,8 +440,29 @@ class AttachedWorkerRuntime:
                         "extension snapshots changed during this attached session; "
                         "submit the work prompt again"
                     )
+                if event.kind is HookEventKind.WORKER_STOPPING and session.work_id is not None:
+                    event = event.model_copy(update={
+                        "continuation_active": (
+                            event.continuation_active or session.continuation_requested
+                        ),
+                    })
                 output = await self._assess_event(session, event)
+                if (
+                    event.kind is HookEventKind.WORKER_STOPPING
+                    and session.work_id is not None
+                    and output.action is HookAction.BLOCK
+                ):
+                    session.continuation_requested = True
 
+            if event.event_id is not None:
+                session.replayed_outcomes.append({
+                    "event_id": event.event_id,
+                    "fingerprint": fingerprint,
+                    "outcome": output.model_dump(mode="json"),
+                })
+                session.replayed_outcomes = session.replayed_outcomes[
+                    -self.config.event_history_limit :
+                ]
             self._bound_state(session)
             session.touch(self.store.ttl_seconds)
             self.store.save(session)
@@ -417,10 +477,21 @@ class AttachedWorkerRuntime:
             self.candidates,
             self.routing_groups,
             self.router,
+            require_match=bool(self.candidates.global_ids()),
         )
         active_ids = decision.active_responsibility_ids
+        session.prompt_routed = True
         if not active_ids:
+            if not self.candidates.global_ids():
+                session.state = None
+                return HookOutcome()
             raise ResponsibilityRoutingError("routing activated no responsibilities")
+        guidance = "\n\n".join(
+            text for responsibility_id in active_ids
+            if (text := self.candidates.context_for(responsibility_id))
+        )
+        if len(guidance) > self.config.field_limit:
+            raise HookError("selected responsibility context exceeds the field limit")
 
         state = session.state or FactoryState(
             run_id=(
@@ -474,7 +545,8 @@ class AttachedWorkerRuntime:
         names = ", ".join(active_ids)
         return HookOutcome(
             action=HookAction.INJECT_CONTEXT,
-            reason=f"Foreman attached. Active responsibilities: {names}.",
+            reason=f"Foreman attached. Active responsibilities: {names}."
+            + (f"\n\n{guidance}" if guidance else ""),
         )
 
     async def _assess_event(
@@ -495,6 +567,16 @@ class AttachedWorkerRuntime:
             worker.finished_at = datetime.now(UTC)
             state.active_workers = []
             state.completed_workers = [worker.worker_id]
+            providers = selected_command_evidence(
+                active.checks(), self.config.command_evidence
+            )
+            results = await run_command_evidence_providers(
+                providers,
+                Path(state.repository),
+                worker_id=worker.worker_id,
+                output_limit=self.config.output_limit,
+            )
+            state.command_evidence.extend(results)
         else:
             worker.status = WorkerStatus.RUNNING
             worker.finished_at = None
@@ -507,6 +589,14 @@ class AttachedWorkerRuntime:
             state,
             self.config,
             recent_events=session.recent_events,
+            current_operation=event.model_dump(
+                mode="json",
+                include={
+                    "client", "kind", "source_event_name", "turn_id", "tool_name",
+                    "tool_use_id", "tool_input",
+                },
+                exclude_none=True,
+            ),
             repository_instruction_files=active.repository_instruction_files(),
         )
         try:
@@ -616,6 +706,8 @@ class AttachedWorkerRuntime:
         limit = self.config.worker_history_limit
         state.result_history = state.result_history[-limit:]
         state.intervention_history = state.intervention_history[-limit:]
+        evidence_limit = max(limit, len(self.config.command_evidence) * limit)
+        state.command_evidence = state.command_evidence[-evidence_limit:]
         state.errors = state.errors[-limit:]
 
     async def close(self) -> None:

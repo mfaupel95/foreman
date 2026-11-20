@@ -1,4 +1,7 @@
-# Why Jev fits the experiment
+# Why Jev fits Foreman
+
+Jev was Foreman's first decision-model provider and remains the default.
+The architecture now also supports [OpenAI and future adapters](decision-models.md).
 
 Foreman needs a model to turn heterogeneous factory evidence into several narrow, uncertain
 judgments. TypeSafe AI's Jev has an interface shaped around that job.
@@ -19,8 +22,8 @@ must be parsed.
 
 ## Parallel questions
 
-All active responsibilities' checks share the same compact observation and are submitted in one
-`system_one` call. Their IDs and Jev instructions come from the active responsibilities' TOML
+Checks sharing an evidence selection are submitted together in a `system_one` call. Different
+evidence selections produce separate, filtered calls. Their IDs and Jev instructions come from the active responsibilities' TOML
 definitions. Ten checks are global; the conditional documentation responsibility contributes an
 eleventh when incoming work explicitly requires documentation.
 TypeSafe states that questions in a request are evaluated independently and in parallel. This is a
@@ -37,7 +40,7 @@ persists the scores, and lets code decide whether an action is allowed.
 
 ## Speed as an architectural enabler
 
-The experiment is interesting only if supervision is materially cheaper and faster than the work it
+The architecture is useful only if supervision is materially cheaper and faster than the work it
 watches. TypeSafe positions Jev for low-latency structured decisions rather than text generation.
 Foreman does not depend on a marketing latency number: calls have explicit timeouts, events are
 debounced, and the assessment interval is configurable.

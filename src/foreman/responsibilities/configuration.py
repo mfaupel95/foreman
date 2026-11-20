@@ -4,11 +4,12 @@ import re
 import tomllib
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from foreman.config import FactoryConfig
+from foreman.evidence import unknown_evidence_providers
 from foreman.responsibilities.base import (
     Check,
     Responsibility,
@@ -16,6 +17,7 @@ from foreman.responsibilities.base import (
     ResponsibilityRoute,
 )
 from foreman.responsibilities.builtin import COMPLETION, VERIFICATION, builtin_registry
+from foreman.responsibilities.declarative import DeclarativeResponsibility
 
 _REQUIRED_GLOBAL_RESPONSIBILITIES = {COMPLETION, VERIFICATION}
 _RESPONSIBILITY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -27,18 +29,30 @@ class ResponsibilityConfigError(ValueError):
 
 
 class CheckFileConfig(BaseModel):
-    """The Jev-facing definition of one recurring responsibility check."""
+    """The decision model definition of one recurring responsibility check."""
 
     model_config = ConfigDict(extra="forbid")
 
     instructions: str
     min_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    evidence: tuple[str, ...] | None = None
 
     @field_validator("instructions")
     @classmethod
     def nonempty_instructions(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("check instructions cannot be empty")
+        return value
+
+    @field_validator("evidence")
+    @classmethod
+    def valid_evidence(cls, value: tuple[str, ...] | None) -> tuple[str, ...] | None:
+        if value is None:
+            return value
+        if not value or any(not provider.strip() for provider in value):
+            raise ValueError("check evidence must contain non-empty provider ids")
+        if len(value) != len(set(value)):
+            raise ValueError("check evidence provider ids must be unique")
         return value
 
 
@@ -48,17 +62,21 @@ class ResponsibilityFileConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
+    kind: Literal["declarative"] | None = None
+    context: str | None = Field(default=None, min_length=1, max_length=50_000)
+    failure_action: Literal["steer", "stop", "escalate"] = "steer"
+    failure_message: str | None = Field(default=None, min_length=1, max_length=50_000)
     always: bool | None = None
     routing_instructions: str | None = None
     routing_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     checks: dict[str, CheckFileConfig] = Field(default_factory=dict)
     settings: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("routing_instructions")
+    @field_validator("routing_instructions", "context", "failure_message")
     @classmethod
     def nonempty_routing_instructions(cls, value: str | None) -> str | None:
         if value is not None and not value.strip():
-            raise ValueError("routing_instructions cannot be empty")
+            raise ValueError("responsibility text cannot be empty")
         return value
 
     @field_validator("checks")
@@ -88,6 +106,7 @@ class ResponsibilityFileConfig(BaseModel):
                 check_id=check_id,
                 instructions=definition.instructions,
                 min_threshold=definition.min_threshold,
+                evidence=definition.evidence,
             )
             for check_id, definition in self.checks.items()
         )
@@ -170,6 +189,8 @@ def configured_registry(
     config_dir: Path | str | None = None,
     additional: Iterable[Responsibility] = (),
     additional_configs: Mapping[str, ResponsibilityFileConfig] | None = None,
+    overrides: Mapping[str, ResponsibilityFileConfig] | None = None,
+    require_lifecycle: bool = True,
 ) -> ResponsibilityRegistry:
     """Build candidates from installed implementations and central Foreman configuration."""
 
@@ -182,6 +203,12 @@ def configured_registry(
             f"{', '.join(sorted(conflicts))}"
         )
     configurations.update(contributed)
+    for responsibility_id, override in (overrides or {}).items():
+        base = configurations.get(responsibility_id)
+        if base is None:
+            configurations[responsibility_id] = override
+        else:
+            configurations[responsibility_id] = _overlay_config(base, override)
     configured_checks = {
         responsibility_id: config.configured_checks(responsibility_id)
         for responsibility_id, config in configurations.items()
@@ -234,7 +261,31 @@ def configured_registry(
             ) from error
         configured_additional.append(responsibility)
 
-    candidates = (*builtins, *configured_additional)
+    declarative: list[DeclarativeResponsibility] = []
+    installed_ids = {item.id for item in (*builtins, *configured_additional)}
+    for responsibility_id, definition in configurations.items():
+        if definition.kind != "declarative":
+            continue
+        if responsibility_id in installed_ids:
+            raise ResponsibilityConfigError(
+                "declarative responsibility cannot replace an installed implementation: "
+                + responsibility_id
+            )
+        if definition.settings:
+            raise ResponsibilityConfigError("declarative responsibilities do not accept settings")
+        try:
+            declarative.append(DeclarativeResponsibility(
+                id=responsibility_id,
+                check_definitions=definition.configured_checks(responsibility_id),
+                failure_action=definition.failure_action,
+                failure_message=definition.failure_message or definition.context,
+            ))
+        except ValueError as error:
+            raise ResponsibilityConfigError(
+                f"invalid declarative responsibility {responsibility_id}: {error}"
+            ) from error
+
+    candidates = (*builtins, *configured_additional, *declarative)
     candidate_ids = {responsibility.id for responsibility in candidates}
     unknown = set(configurations) - candidate_ids
     if unknown:
@@ -243,7 +294,7 @@ def configured_registry(
             f"{', '.join(sorted(unknown))}"
         )
 
-    for responsibility_id in _REQUIRED_GLOBAL_RESPONSIBILITIES:
+    for responsibility_id in _REQUIRED_GLOBAL_RESPONSIBILITIES if require_lifecycle else ():
         configured = configurations[responsibility_id]
         if not configured.enabled or configured.always is False:
             raise ResponsibilityConfigError(
@@ -266,6 +317,24 @@ def configured_registry(
             )
             for responsibility in enabled
         }
-        return ResponsibilityRegistry(enabled, routes=routes)
+        registry = ResponsibilityRegistry(
+            enabled,
+            routes=routes,
+            contexts={
+                item.id: context for item in enabled
+                if (context := configurations[item.id].context) is not None
+            },
+        )
+        unknown_evidence = unknown_evidence_providers(
+            registry.checks(), factory_config.command_evidence
+        )
+        if unknown_evidence:
+            raise ResponsibilityConfigError(
+                "checks reference unknown evidence providers: "
+                + ", ".join(sorted(unknown_evidence))
+            )
+        return registry
+    except ResponsibilityConfigError:
+        raise
     except ValueError as error:
         raise ResponsibilityConfigError(f"invalid responsibility routing: {error}") from error

@@ -28,7 +28,7 @@ class TerminalRenderer:
                 else "Worker"
             )
             self.console.print(f"{label} {payload.get('worker_id')} started.")
-            self.console.print("Codex is working... Foreman is watching independently.")
+            self.console.print("Worker is running... Foreman is watching independently.")
         elif event.event_type in {
             EventType.WORKER_COMPLETED,
             EventType.WORKER_FAILED,
@@ -37,6 +37,12 @@ class TerminalRenderer:
         }:
             self.console.print(
                 f"{payload.get('worker_id')} {str(payload.get('status', '')).replace('_', ' ')}."
+            )
+        elif event.event_type is EventType.COMMAND_EVIDENCE_STARTED:
+            self.console.print(f"Evidence provider {payload.get('provider_id')} started.")
+        elif event.event_type is EventType.COMMAND_EVIDENCE_COMPLETED:
+            self.console.print(
+                f"Evidence provider {payload.get('provider_id')} {payload.get('status')}."
             )
         elif event.event_type is EventType.FOREMAN_OBSERVED:
             self.console.print("Watching factory floor...")
