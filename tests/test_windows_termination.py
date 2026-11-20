@@ -15,8 +15,12 @@ from foreman.workers.hermes import HermesWorker
 async def test_unconfirmed_windows_termination_is_bounded(returncode):
     worker = HermesWorker(probe_capabilities=False, graceful_termination_seconds=0.05)
     never = asyncio.Event()
-    worker.process = SimpleNamespace(pid=123, returncode=None, wait=AsyncMock(side_effect=never.wait))
-    with patch("subprocess.run", return_value=subprocess.CompletedProcess(["taskkill"], returncode)):
+    worker.process = SimpleNamespace(
+        pid=123, returncode=None, wait=AsyncMock(side_effect=never.wait)
+    )
+    with patch(
+        "subprocess.run", return_value=subprocess.CompletedProcess(["taskkill"], returncode)
+    ):
         with pytest.raises(RuntimeError, match="Hermes process termination"):
             await asyncio.wait_for(worker.terminate("worker_timeout"), timeout=0.5)
 

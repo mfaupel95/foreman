@@ -345,7 +345,9 @@ class HermesWorker:
             except (OSError, subprocess.TimeoutExpired) as error:
                 raise RuntimeError("Hermes process termination could not run taskkill") from error
             if result.returncode and process.returncode is None:
-                raise RuntimeError(f"Hermes process termination: taskkill exited {result.returncode}")
+                raise RuntimeError(
+                    f"Hermes process termination: taskkill exited {result.returncode}"
+                )
             try:
                 await asyncio.wait_for(process.wait(), self.graceful_termination_seconds)
             except TimeoutError as error:
