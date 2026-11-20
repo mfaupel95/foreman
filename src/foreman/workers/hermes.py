@@ -301,9 +301,17 @@ class HermesWorker:
         except asyncio.CancelledError:
             record.status = WorkerStatus.CANCELLED
             record.termination_reason = "cancelled"
-            await self.terminate("cancelled")
+            try:
+                await self.terminate("cancelled")
+            except RuntimeError as error:
+                record.stderr = (
+                    f"{record.stderr}\n[foreman: {error}]"
+                )[-self.output_limit :]
             raise
         finally:
+            if self._termination_reason and self.process.returncode is None:
+                for task in (stdout_task, stderr_task):
+                    task.cancel()
             results = await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
             for stream_name, outcome in zip(("stdout", "stderr"), results, strict=True):
                 if isinstance(outcome, BaseException) and not isinstance(
@@ -326,14 +334,22 @@ class HermesWorker:
             # Windows has no process groups / killpg; taskkill /T reaches the
             # whole tree (hermes.exe spawns node children), /F forces it.
             # asyncio.to_thread keeps the async loop unblocked.
-            await asyncio.to_thread(
-                subprocess.run,
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                capture_output=True,
-                timeout=15,
-                check=False,
-            )
-            await process.wait()
+            try:
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    capture_output=True,
+                    timeout=15,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise RuntimeError("Hermes process termination could not run taskkill") from error
+            if result.returncode and process.returncode is None:
+                raise RuntimeError(f"Hermes process termination: taskkill exited {result.returncode}")
+            try:
+                await asyncio.wait_for(process.wait(), self.graceful_termination_seconds)
+            except TimeoutError as error:
+                raise RuntimeError("Hermes process termination was not confirmed") from error
             return
         try:
             os.killpg(process.pid, signal.SIGTERM)
